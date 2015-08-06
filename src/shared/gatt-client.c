@@ -51,6 +51,10 @@ struct bt_gatt_client {
 	struct bt_att *att;
 	int ref_count;
 
+	bt_gatt_client_callback_t mtu_callback;
+	bt_gatt_client_destroy_func_t mtu_destroy;
+	void *mtu_data;
+
 	bt_gatt_client_callback_t ready_callback;
 	bt_gatt_client_destroy_func_t ready_destroy;
 	void *ready_data;
@@ -1046,6 +1050,17 @@ done:
 	op->complete_func(op, success, att_ecode);
 }
 
+static void notify_mtu_exchanged(struct bt_gatt_client *client, bool success,
+							uint8_t att_ecode)
+{
+	if (!client->mtu_callback)
+		return;
+
+	bt_gatt_client_ref(client);
+	client->mtu_callback(success, att_ecode, client->mtu_data);
+	bt_gatt_client_unref(client);
+}
+
 static void notify_client_ready(struct bt_gatt_client *client, bool success,
 							uint8_t att_ecode)
 {
@@ -1065,6 +1080,7 @@ static void exchange_mtu_cb(bool success, uint8_t att_ecode, void *user_data)
 
 	op->success = success;
 	client->mtu_req_id = 0;
+	notify_mtu_exchanged(client, success, att_ecode);
 
 	if (!success) {
 		util_debug(client->debug_callback, client->debug_data,
@@ -1784,6 +1800,24 @@ void bt_gatt_client_unref(struct bt_gatt_client *client)
 		return;
 
 	bt_gatt_client_free(client);
+}
+
+bool bt_gatt_client_set_mtu_exchanged_handler(struct bt_gatt_client *client,
+					bt_gatt_client_callback_t callback,
+					void *user_data,
+					bt_gatt_client_destroy_func_t destroy)
+{
+	if (!client)
+		return false;
+
+	if (client->mtu_destroy)
+		client->mtu_destroy(client->mtu_data);
+
+	client->mtu_callback = callback;
+	client->mtu_destroy = destroy;
+	client->mtu_data = user_data;
+
+	return true;
 }
 
 bool bt_gatt_client_is_ready(struct bt_gatt_client *client)
