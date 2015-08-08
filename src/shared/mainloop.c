@@ -35,6 +35,8 @@
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <sys/epoll.h>
+#include <pthread.h>
+#include <stdbool.h>
 
 #include "mainloop.h"
 
@@ -50,11 +52,9 @@ struct mainloop_data {
 	mainloop_event_func callback;
 	mainloop_destroy_func destroy;
 	void *user_data;
+	struct mainloop_data* next;
+	struct mainloop_data* previous;
 };
-
-#define MAX_MAINLOOP_ENTRIES 128
-
-static struct mainloop_data *mainloop_list[MAX_MAINLOOP_ENTRIES];
 
 struct timeout_data {
 	int fd;
@@ -73,14 +73,71 @@ struct signal_data {
 
 static struct signal_data *signal_data;
 
+/* I don't have the initial insight into the original implementation. However, it
+ * seemed limited before. Before these changes to make it a linked list, it was
+ * just an array with the file descriptor as the index, but since the file
+ * descriptor is an int incremented on every subsequent connection the old way would
+ * fail unless the array has 4 billion entries. Since in my testing there's not
+ * that many file descriptors in use concurrently (only 2 for my specific use
+ * case), I changed this to be a doubly linked list where we just keep a pointer
+ * to the head of the list. However, insert is now O(1), access is now O(n), and
+ * delete is O(1), but none of these are automic they need to be protected with
+ * a mutex. */
+static pthread_mutex_t mainloop_list_mutex;
+static struct mainloop_data *mainloop_list_head;
+
+static void mainloop_list_add_entry(struct mainloop_data* data) {
+	pthread_mutex_lock(&mainloop_list_mutex);
+	data->next = mainloop_list_head;
+	if (mainloop_list_head != NULL) {
+		mainloop_list_head->previous = data;
+	}
+	mainloop_list_head = data;
+	pthread_mutex_unlock(&mainloop_list_mutex);
+}
+
+static struct mainloop_data* mainloop_list_lookup_entry(int fd) {
+	struct mainloop_data *data = mainloop_list_head;
+	pthread_mutex_lock(&mainloop_list_mutex);
+	while (data) {
+		if (data->fd == fd) {
+			pthread_mutex_unlock(&mainloop_list_mutex);
+			return data;
+		}
+		data = data->next;
+	}
+
+	pthread_mutex_unlock(&mainloop_list_mutex);
+	return NULL;
+}
+
+static void mainloop_list_remove_entry(struct mainloop_data* data, bool acquire_lock) {
+	if (acquire_lock) {
+		pthread_mutex_lock(&mainloop_list_mutex);
+	}
+	if (data == mainloop_list_head) {
+		mainloop_list_head = data->next;
+	}
+
+	if (data->next) {
+		data->next->previous = data->previous;
+	}
+
+	if (data->previous) {
+		data->previous->next = data->next;
+	}
+	if (acquire_lock) {
+		pthread_mutex_unlock(&mainloop_list_mutex);
+	}
+}
+
 void mainloop_init(void)
 {
 	unsigned int i;
 
 	epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-
-	for (i = 0; i < MAX_MAINLOOP_ENTRIES; i++)
-		mainloop_list[i] = NULL;
+	pthread_mutex_init(&mainloop_list_mutex, NULL);
+	mainloop_list_head = NULL;
 
 	epoll_terminate = 0;
 }
@@ -124,6 +181,7 @@ static void signal_callback(int fd, uint32_t events, void *user_data)
 int mainloop_run(void)
 {
 	unsigned int i;
+	struct mainloop_data* mainloop_data_current = NULL;
 
 	if (signal_data) {
 		if (sigprocmask(SIG_BLOCK, &signal_data->mask, NULL) < 0)
@@ -167,10 +225,12 @@ int mainloop_run(void)
 			signal_data->destroy(signal_data->user_data);
 	}
 
-	for (i = 0; i < MAX_MAINLOOP_ENTRIES; i++) {
-		struct mainloop_data *data = mainloop_list[i];
-
-		mainloop_list[i] = NULL;
+	pthread_mutex_lock(&mainloop_list_mutex);
+	mainloop_data_current = mainloop_list_head;
+	while (mainloop_data_current != NULL) {
+		struct mainloop_data *data = mainloop_data_current;
+		mainloop_data_current = mainloop_data_current->next;
+		mainloop_list_remove_entry(data, false);
 
 		if (data) {
 			epoll_ctl(epoll_fd, EPOLL_CTL_DEL, data->fd, NULL);
@@ -184,7 +244,8 @@ int mainloop_run(void)
 
 	close(epoll_fd);
 	epoll_fd = 0;
-
+	pthread_mutex_unlock(&mainloop_list_mutex);
+	pthread_mutex_destroy(&mainloop_list_mutex);
 	return exit_status;
 }
 
@@ -195,12 +256,14 @@ int mainloop_add_fd(int fd, uint32_t events, mainloop_event_func callback,
 	struct epoll_event ev;
 	int err;
 
-	if (fd < 0 || fd > MAX_MAINLOOP_ENTRIES - 1 || !callback)
+	if (fd < 0 || !callback) {
 		return -EINVAL;
+	}
 
 	data = malloc(sizeof(*data));
-	if (!data)
+	if (!data) {
 		return -ENOMEM;
+	}
 
 	memset(data, 0, sizeof(*data));
 	data->fd = fd;
@@ -208,6 +271,8 @@ int mainloop_add_fd(int fd, uint32_t events, mainloop_event_func callback,
 	data->callback = callback;
 	data->destroy = destroy;
 	data->user_data = user_data;
+	data->previous = NULL;
+	data->next = NULL;
 
 	memset(&ev, 0, sizeof(ev));
 	ev.events = events;
@@ -219,8 +284,7 @@ int mainloop_add_fd(int fd, uint32_t events, mainloop_event_func callback,
 		return err;
 	}
 
-	mainloop_list[fd] = data;
-
+	mainloop_list_add_entry(data);
 	return 0;
 }
 
@@ -230,10 +294,10 @@ int mainloop_modify_fd(int fd, uint32_t events)
 	struct epoll_event ev;
 	int err;
 
-	if (fd < 0 || fd > MAX_MAINLOOP_ENTRIES - 1)
+	if (fd < 0)
 		return -EINVAL;
 
-	data = mainloop_list[fd];
+	data = mainloop_list_lookup_entry(fd);
 	if (!data)
 		return -ENXIO;
 
@@ -255,15 +319,14 @@ int mainloop_remove_fd(int fd)
 	struct mainloop_data *data;
 	int err;
 
-	if (fd < 0 || fd > MAX_MAINLOOP_ENTRIES - 1)
+	if (fd < 0)
 		return -EINVAL;
 
-	data = mainloop_list[fd];
+	data = mainloop_list_lookup_entry(fd);
 	if (!data)
 		return -ENXIO;
 
-	mainloop_list[fd] = NULL;
-
+	mainloop_list_remove_entry(data, true);
 	err = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, data->fd, NULL);
 
 	if (data->destroy)
